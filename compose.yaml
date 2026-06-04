@@ -10,6 +10,7 @@ services:
       - ./storage/logs:/www/storage/logs
       - ./storage/theme:/www/storage/theme
       - ./plugins:/www/plugins
+      - ./plugins-core:/www/plugins-core
       - redis-data:/data
     environment:
       - RESOURCE_PROFILE=balanced
