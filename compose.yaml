@@ -1,0 +1,40 @@
+services:
+  web:
+    image: ghcr.io/cedar2025/xboard:new
+    volumes:
+      - ./.docker/.data/redis/:/data/
+      - ./.env:/www/.env
+      - ./.docker/.data/:/www/.docker/.data
+      - ./app:/www/app  # 添加这行 - 挂载 app 目录
+      - ./storage/logs:/www/storage/logs
+      - ./storage/theme:/www/storage/theme
+      - ./plugins:/www/plugins
+    environment:
+      - docker=true
+    depends_on:
+      - redis
+    command: php artisan octane:start --host=0.0.0.0 --port=7001
+    restart: on-failure
+    ports:
+      - 7001:7001
+      
+  horizon:
+    image: ghcr.io/cedar2025/xboard:new
+    volumes:
+      - ./.docker/.data/redis/:/data/
+      - ./.env:/www/.env
+      - ./.docker/.data/:/www/.docker/.data
+      - ./app:/www/app  # 添加这行 - 挂载 app 目录
+      - ./storage/logs:/www/storage/logs
+      - ./plugins:/www/plugins
+    restart: on-failure
+    command: php artisan horizon
+    depends_on:
+      - redis
+      
+  redis:
+    image: redis:7-alpine
+    command: redis-server --unixsocket /data/redis.sock --unixsocketperm 777 --save 900 1 --save 300 10 --save 60 10000
+    restart: unless-stopped
+    volumes:
+      - ./.docker/.data/redis:/data
