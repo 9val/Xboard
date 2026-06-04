@@ -9,6 +9,7 @@ use App\Models\User;
 use App\Utils\CacheKey;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 
@@ -228,17 +229,22 @@ class MailService
      * @param array $params 包含邮件参数的数组，必须包含以下字段：
      *   - email: 收件人邮箱地址
      *   - subject: 邮件主题
-     *   - template_name: 邮件模板名称，例如 "welcome" 或 "password_reset"
-     *   - template_value: 邮件模板变量，一个关联数组，包含模板中需要替换的变量和对应的值
-     * @return array 包含邮件发送结果的数组，包含以下字段：
-     *   - email: 收件人邮箱地址
-     *   - subject: 邮件主题
      *   - template_name: 邮件模板名称
-     *   - error: 如果邮件发送失败，包含错误信息；否则为 null
-     * @throws \InvalidArgumentException 如果 $params 参数缺少必要的字段，抛出此异常
+     *   - template_value: 邮件模板变量
+     * @return array 包含邮件发送结果的数组
      */
     public static function sendEmail(array $params)
     {
+        // 优先检查是否配置了自定义邮件API（Cloudflare Worker + Brevo）
+        $useCustomApi = admin_setting('email_use_custom_api', false);
+        $customApiEndpoint = admin_setting('email_custom_api_endpoint');
+        $customApiToken = admin_setting('email_custom_api_token');
+
+        if ($useCustomApi && $customApiEndpoint && $customApiToken) {
+            return self::sendEmailViaCustomApi($params, $customApiEndpoint, $customApiToken);
+        }
+
+        // 以下为原有 SMTP + DB模板 逻辑
         if (admin_setting('email_host')) {
             Config::set('mail.host', admin_setting('email_host', config('mail.host')));
             Config::set('mail.port', admin_setting('email_port', config('mail.port')));
@@ -248,6 +254,7 @@ class MailService
             Config::set('mail.from.address', admin_setting('email_from_address', config('mail.from.address')));
             Config::set('mail.from.name', admin_setting('app_name', 'XBoard'));
         }
+
         $email = $params['email'];
         $subject = $params['subject'];
         $templateName = $params['template_name'];
@@ -270,8 +277,7 @@ class MailService
 
         $params['template_value'] = $templateValue;
 
-        // Check for DB template override (cached to avoid per-email queries in bulk sends).
-        // Cache 'none' sentinel for templates that don't exist in DB.
+        // 检查数据库模板（带缓存）
         $cacheKey = "mail_template:{$templateName}";
         $cached = Cache::get($cacheKey);
         if ($cached === null) {
@@ -307,6 +313,7 @@ class MailService
             Log::error($e);
             $error = $e->getMessage();
         }
+
         $log = [
             'email' => $params['email'],
             'subject' => $params['subject'],
@@ -314,6 +321,93 @@ class MailService
             'error' => $error,
             'config' => config('mail')
         ];
+
+        MailLog::create($log);
+        return $log;
+    }
+
+    /**
+     * 通过自定义 API 发送邮件（Cloudflare Worker + Brevo）
+     */
+    private static function sendEmailViaCustomApi(array $params, string $apiEndpoint, string $apiToken)
+    {
+        $email = $params['email'];
+        $subject = $params['subject'];
+        $templateName = 'mail.' . admin_setting('email_template', 'default') . '.' . $params['template_name'];
+
+        try {
+            // 渲染邮件模板为 HTML
+            $htmlContent = view($templateName, $params['template_value'])->render();
+
+            // 获取发件人邮箱
+            $fromEmail = admin_setting('email_from_address')
+                ?? admin_setting('email_username')
+                ?? config('mail.from.address')
+                ?? 'noreply@example.com';
+
+            // 调用 Cloudflare Worker API
+            $response = Http::timeout(30)->withHeaders([
+                'Authorization' => 'Bearer ' . $apiToken,
+                'Content-Type' => 'application/json',
+            ])->post($apiEndpoint, [
+                'sender' => [
+                    'name' => admin_setting('app_name', 'XBoard'),
+                    'email' => $fromEmail
+                ],
+                'to' => [
+                    [
+                        'email' => $email,
+                        'name' => $email
+                    ]
+                ],
+                'subject' => $subject,
+                'htmlContent' => $htmlContent
+            ]);
+
+            if ($response->successful()) {
+                $responseData = $response->json();
+                $error = null;
+
+                Log::info('邮件发送成功 (Custom API)', [
+                    'email' => $email,
+                    'subject' => $subject,
+                    'from' => $fromEmail,
+                    'message_id' => $responseData['messageId'] ?? null,
+                    'account_index' => $responseData['accountIndex'] ?? null
+                ]);
+            } else {
+                $error = 'API Error: ' . ($response->json()['error'] ?? $response->body());
+
+                Log::error('邮件发送失败 (Custom API)', [
+                    'email' => $email,
+                    'subject' => $subject,
+                    'from' => $fromEmail,
+                    'status' => $response->status(),
+                    'error' => $error
+                ]);
+            }
+        } catch (\Exception $e) {
+            Log::error('邮件发送异常 (Custom API)', [
+                'email' => $email,
+                'subject' => $subject,
+                'exception' => $e->getMessage()
+            ]);
+            $error = $e->getMessage();
+            $fromEmail = $fromEmail ?? 'unknown';
+        }
+
+        $log = [
+            'email' => $email,
+            'subject' => $subject,
+            'template_name' => $templateName,
+            'error' => $error,
+            'config' => [
+                'driver' => 'custom_api',
+                'endpoint' => $apiEndpoint,
+                'from' => $fromEmail ?? 'unknown'
+            ]
+        ];
+
         MailLog::create($log);
         return $log;
     }
@@ -329,9 +423,6 @@ class MailService
                 $safe[$key] = e((string) $value);
             }
         }
-        // 'content' may be pre-escaped text or admin-authored HTML.
-        // For text mode, apply nl2br so line breaks survive in DB templates
-        // (Blade templates handle this with {!! nl2br($content) !!}).
         if (isset($templateValue['content'])) {
             $content = (string) $templateValue['content'];
             $contentMode = $templateValue['content_mode'] ?? null;
