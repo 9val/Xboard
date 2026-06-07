@@ -11,6 +11,7 @@ services:
       - ./storage/theme:/www/storage/theme
       - ./plugins:/www/plugins
       - ./plugins-core:/www/plugins-core
+      - ./app/Services/MailService.php:/www/app/Services/MailService.php
       - redis-data:/data
     environment:
       - RESOURCE_PROFILE=balanced
