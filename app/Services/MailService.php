@@ -239,11 +239,6 @@ class MailService
      */
     public static function sendEmail(array $params)
     {
-        // Cloudflare Email Service 分支：检测到 email_encryption 为 'cloudflare' 时走此逻辑
-        if (admin_setting('email_encryption') === 'cloudflare') {
-            return self::sendViaCloudflare($params);
-        }
-
         if (admin_setting('email_host')) {
             Config::set('mail.host', admin_setting('email_host', config('mail.host')));
             Config::set('mail.port', admin_setting('email_port', config('mail.port')));
@@ -318,112 +313,6 @@ class MailService
             'template_name' => $params['template_name'],
             'error' => $error,
             'config' => config('mail')
-        ];
-        MailLog::create($log);
-        return $log;
-    }
-
-    /**
-     * 通过 Cloudflare Email Service REST API 发送邮件
-     */
-    private static function sendViaCloudflare(array $params): array
-    {
-        $accountId = admin_setting('email_host');       // 借用 SMTP Host 字段存 Account ID
-        $apiToken  = admin_setting('email_password');   // 借用 SMTP 密码字段存 API Token
-        $fromAddr  = admin_setting('email_from_address');
-        $fromName  = admin_setting('app_name', 'XBoard');
-
-        $templateName  = $params['template_name'];
-        $templateValue = $params['template_value'] ?? [];
-        $subject       = $params['subject'];
-
-        // 处理 vars 占位符替换
-        $vars        = is_array($templateValue) ? ($templateValue['vars'] ?? []) : [];
-        $contentMode = is_array($templateValue) ? ($templateValue['content_mode'] ?? null) : null;
-
-        if (is_array($vars) && !empty($vars)) {
-            $subject = self::renderPlaceholders((string) $subject, $vars);
-
-            if (is_array($templateValue) && isset($templateValue['content']) && is_string($templateValue['content'])) {
-                $templateValue['content'] = self::renderPlaceholders($templateValue['content'], $vars);
-            }
-        }
-
-        if ($contentMode === 'text' && is_array($templateValue) && isset($templateValue['content']) && is_string($templateValue['content'])) {
-            $templateValue['content'] = e($templateValue['content']);
-        }
-
-        // 复用模板缓存逻辑，优先使用数据库模板
-        $cacheKey = "mail_template:{$templateName}";
-        $cached   = Cache::get($cacheKey);
-        if ($cached === null) {
-            $dbTemplate = MailTemplate::where('name', $templateName)->first();
-            Cache::put($cacheKey, $dbTemplate ?: 'none', 3600);
-        } else {
-            $dbTemplate = ($cached === 'none') ? null : $cached;
-        }
-
-        if ($dbTemplate) {
-            $renderVars     = self::buildSafeVars($templateValue);
-            $subject        = self::renderPlaceholders($dbTemplate->subject, $renderVars) ?: $subject;
-            $html           = self::renderPlaceholders($dbTemplate->content, $renderVars);
-            $resolvedTplName = 'db:' . $templateName;
-        } else {
-            $html            = view('mail.default.' . $templateName, $templateValue)->render();
-            $resolvedTplName = 'mail.default.' . $templateName;
-        }
-
-        // 调用 Cloudflare REST API
-        $payload = json_encode([
-            'from'    => $fromAddr,
-            'to'      => $params['email'],
-            'subject' => $subject,
-            'html'    => $html,
-        ]);
-
-        $error = null;
-        try {
-            $ch = curl_init("https://api.cloudflare.com/client/v4/accounts/{$accountId}/email/sending/send");
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_POST           => true,
-                CURLOPT_POSTFIELDS     => $payload,
-                CURLOPT_TIMEOUT        => 10,
-                CURLOPT_HTTPHEADER     => [
-                    "Authorization: Bearer {$apiToken}",
-                    "Content-Type: application/json",
-                ],
-            ]);
-            $rawResponse = curl_exec($ch);
-            $httpCode    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $curlError   = curl_error($ch);
-            curl_close($ch);
-
-            if ($curlError) {
-                throw new \RuntimeException("cURL 错误: {$curlError}");
-            }
-
-            $response = json_decode($rawResponse, true);
-
-            if ($httpCode !== 200 || empty($response['success'])) {
-                $errDetail = json_encode($response['errors'] ?? $rawResponse);
-                throw new \RuntimeException("Cloudflare API 返回错误 (HTTP {$httpCode}): {$errDetail}");
-            }
-        } catch (\Exception $e) {
-            Log::error('Cloudflare 邮件发送失败', [
-                'email'   => $params['email'],
-                'subject' => $subject,
-                'error'   => $e->getMessage(),
-            ]);
-            $error = $e->getMessage();
-        }
-
-        $log = [
-            'email'         => $params['email'],
-            'subject'       => $subject,
-            'template_name' => $resolvedTplName,
-            'error'         => $error,
-            'config'        => ['driver' => 'cloudflare', 'account_id' => $accountId],
         ];
         MailLog::create($log);
         return $log;
