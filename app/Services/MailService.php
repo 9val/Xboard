@@ -375,7 +375,7 @@ class MailService
 
         // 调用 Cloudflare REST API
         $payload = json_encode([
-            'from'    => ['address' => $fromAddr, 'name' => $fromName],
+            'from'    => $fromAddr,
             'to'      => $params['email'],
             'subject' => $subject,
             'html'    => $html,
